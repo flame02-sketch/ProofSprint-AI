@@ -1,573 +1,542 @@
+
+from io import BytesIO
 import json
 import re
 import zipfile
-from io import BytesIO
 
 import pymupdf
 import pytesseract
 import streamlit as st
+from docx import Document
 from PIL import Image
+from pptx import Presentation
 
-# Windows Tesseract installation.
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-MAX_ZIP_FILES = 500
-MAX_SOURCE_FILE_BYTES = 500_000
-MAX_TOTAL_SOURCE_BYTES = 10_000_000
-
-SOURCE_EXTENSIONS = {
-    ".py",
-    ".js",
-    ".jsx",
-    ".ts",
-    ".tsx",
-    ".html",
-    ".css",
-    ".java",
-    ".c",
-    ".cpp",
-    ".h",
-    ".cs",
-    ".go",
-    ".rs",
-    ".php",
-    ".rb",
-    ".swift",
-    ".kt",
-    ".sql",
-    ".sh",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".ini",
-    ".md",
-    ".txt",
-    ".xml",
-}
-
-IGNORED_PARTS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-    "dist",
-    "build",
-}
-
-IGNORED_NAMES = {
-    ".env",
-    ".env.local",
-    ".env.production",
-    "id_rsa",
-    "id_ed25519",
-}
-
-STOP_WORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "that",
-    "this",
-    "from",
-    "into",
-    "your",
-    "their",
-    "have",
-    "has",
-    "will",
-    "can",
-    "should",
-    "must",
-    "are",
-    "was",
-    "were",
-    "been",
-    "being",
-    "then",
-    "than",
-    "when",
-    "where",
-    "what",
-    "which",
-    "who",
-    "how",
-    "why",
-    "all",
-    "any",
-    "each",
-    "use",
-    "using",
-    "user",
-    "users",
-    "system",
-    "project",
-    "application",
-    "app",
-    "feature",
-    "features",
-    "support",
-    "based",
-}
-
-WORD_NORMALIZATION = {
-    "completed": "complete",
-    "completes": "complete",
-    "creating": "create",
-    "created": "create",
-    "creates": "create",
-    "tasks": "task",
-    "stored": "store",
-    "stores": "store",
-    "storing": "store",
-    "marked": "mark",
-    "marking": "mark",
-    "saved": "save",
-    "saves": "save",
-    "saving": "save",
-}
-
-DATABASE_INDICATORS = (
-    "sqlite3.connect",
-    "sqlite.connect",
-    "psycopg.connect",
-    "psycopg2.connect",
-    "create_engine(",
-    "pymongo",
-    "mongodb",
-    "mysql.connector",
-    "sqlite3.",
-    "sqlalchemy",
-    "cursor.execute(",
-    "session.add(",
-    "session.commit(",
-    "db.session",
-    "database_url",
+# Tesseract OCR path for Windows
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_ZIP_FILES = 100
+MAX_ZIP_MEMBER_BYTES = 10 * 1024 * 1024
+MAX_ZIP_TOTAL_BYTES = 50 * 1024 * 1024
+
+SUPPORTED_DOCUMENTS = (".pdf", ".txt", ".md", ".docx", ".pptx")
 
 
 def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
-    """Extract selectable PDF text or OCR scanned pages."""
-    extracted_pages = []
+    """Extract PDF text and OCR pages that have no selectable text."""
+    parts = []
+    ocr_pages = 0
 
-    with pymupdf.open(stream=file_bytes, filetype="pdf") as document:
-        page_count = len(document)
+    with pymupdf.open(stream=file_bytes, filetype="pdf") as pdf:
+        for page in pdf:
+            page_text = page.get_text().strip()
 
-        for page_number, page in enumerate(document, start=1):
-            text = page.get_text().strip()
+            if page_text:
+                parts.append(page_text)
+                continue
 
-            if not text:
-                pixmap = page.get_pixmap(dpi=200, alpha=False)
-                image_bytes = pixmap.tobytes("png")
+            pixmap = page.get_pixmap(
+                matrix=pymupdf.Matrix(2, 2),
+                alpha=False,
+            )
+            image = Image.open(BytesIO(pixmap.tobytes("png")))
+            page_text = pytesseract.image_to_string(image).strip()
+            ocr_pages += 1
 
-                with Image.open(BytesIO(image_bytes)) as image:
-                    text = pytesseract.image_to_string(image, lang="eng").strip()
+            if page_text:
+                parts.append(page_text)
 
-            if not text:
-                text = "[No text recognized]"
-
-            extracted_pages.append(f"--- Page {page_number} ---\n{text}")
-
-    return "\n\n".join(extracted_pages), page_count
-
-
-def extract_image_text(image_bytes: bytes) -> tuple[Image.Image, str]:
-    """Open an image and recognize its English text."""
-    with Image.open(BytesIO(image_bytes)) as source:
-        image = source.convert("RGB")
-
-    text = pytesseract.image_to_string(image, lang="eng").strip()
-    return image, text
+    return "\n\n".join(parts), ocr_pages
 
 
-def read_requirements(filename: str, file_bytes: bytes) -> str:
-    """Read PDF or plain-text project requirements."""
-    if filename.lower().endswith(".pdf"):
-        text, _ = extract_pdf_text(file_bytes)
-        return text
+def extract_docx_text(file_bytes: bytes) -> str:
+    """Extract paragraphs and tables from DOCX files."""
+    document = Document(BytesIO(file_bytes))
+    parts = []
 
-    return file_bytes.decode("utf-8-sig", errors="replace")
+    for paragraph in document.paragraphs:
+        if paragraph.text.strip():
+            parts.append(paragraph.text)
 
+    for table in document.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text for cell in row.cells))
 
-def inspect_project_zip(
-    zip_bytes: bytes,
-) -> tuple[list[dict[str, str]], list[str]]:
-    """Read source files from a ZIP without extracting or executing them."""
-    files: list[dict[str, str]] = []
-    warnings: list[str] = []
-    total_bytes = 0
-
-    try:
-        with zipfile.ZipFile(BytesIO(zip_bytes)) as archive:
-            members = archive.infolist()
-
-            if len(members) > MAX_ZIP_FILES:
-                return [], [
-                    f"ZIP contains {len(members)} entries. "
-                    f"The limit is {MAX_ZIP_FILES}."
-                ]
-
-            for member in members:
-                if member.is_dir():
-                    continue
-
-                path = member.filename.replace("\\", "/")
-                parts = path.split("/")
-                filename = parts[-1]
-                lowered_parts = {part.lower() for part in parts}
-
-                if lowered_parts & IGNORED_PARTS:
-                    continue
-
-                if filename.lower() in IGNORED_NAMES or filename.lower().startswith(
-                    ".env"
-                ):
-                    warnings.append(f"Skipped sensitive-looking file: {path}")
-                    continue
-
-                suffix = (
-                    "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-                )
-
-                if suffix not in SOURCE_EXTENSIONS:
-                    continue
-
-                if member.file_size > MAX_SOURCE_FILE_BYTES:
-                    warnings.append(f"Skipped large file: {path}")
-                    continue
-
-                if total_bytes + member.file_size > MAX_TOTAL_SOURCE_BYTES:
-                    warnings.append("Reached the total source-size limit.")
-                    break
-
-                try:
-                    content = archive.read(member)
-                    text = content.decode("utf-8-sig")
-                except (
-                    UnicodeDecodeError,
-                    OSError,
-                    RuntimeError,
-                    zipfile.BadZipFile,
-                ):
-                    warnings.append(f"Skipped unreadable file: {path}")
-                    continue
-
-                files.append({"path": path, "text": text})
-                total_bytes += len(content)
-
-    except (zipfile.BadZipFile, OSError, ValueError):
-        return [], ["The uploaded file is not a readable ZIP archive."]
-
-    if not files and not warnings:
-        warnings.append("No supported source or documentation files found.")
-
-    return files, warnings
+    return "\n".join(parts)
 
 
-def tokenize(text: str) -> set[str]:
-    """Convert prose and code identifiers into comparable keywords."""
-    text = text.replace("_", " ").lower()
-    words = re.findall(r"[a-z][a-z0-9+#.-]*", text)
-    normalized = set()
+def extract_pptx_text(file_bytes: bytes) -> str:
+    """Extract text from PowerPoint slides and tables."""
+    presentation = Presentation(BytesIO(file_bytes))
+    parts = []
 
-    for word in words:
-        word = WORD_NORMALIZATION.get(word, word)
+    for slide_number, slide in enumerate(presentation.slides, start=1):
+        slide_parts = [f"Slide {slide_number}"]
 
-        if len(word) > 2 and word not in STOP_WORDS:
-            normalized.add(word)
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text.strip():
+                slide_parts.append(shape.text)
 
-    return normalized
+            if shape.has_table:
+                for row in shape.table.rows:
+                    slide_parts.append(
+                        " | ".join(cell.text for cell in row.cells)
+                    )
+
+        parts.append("\n".join(slide_parts))
+
+    return "\n\n".join(parts)
 
 
-def extract_requirements(text: str) -> list[str]:
-    """Build a preliminary checklist from requirement-document lines."""
-    requirements = []
+def extract_text_by_name(
+    filename: str,
+    file_bytes: bytes,
+) -> tuple[str, str]:
+    """Extract text according to a supported file extension."""
+    name = filename.lower()
 
-    for line in text.splitlines():
-        cleaned = line.strip()
-        cleaned = re.sub(r"^#{1,6}\s*", "", cleaned)
-        cleaned = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", cleaned)
-        cleaned = cleaned.strip()
+    if name.endswith(".pdf"):
+        text, ocr_pages = extract_pdf_text(file_bytes)
+        return text, f"PDF; OCR attempted on {ocr_pages} page(s)"
 
-        if len(cleaned) < 12:
-            continue
+    if name.endswith((".txt", ".md")):
+        return (
+            file_bytes.decode("utf-8-sig", errors="replace"),
+            "Plain text",
+        )
 
-        if cleaned.startswith(("--- Page ", "[No text")):
-            continue
+    if name.endswith(".docx"):
+        return extract_docx_text(file_bytes), "Word document"
 
-        if cleaned.endswith(":") and len(cleaned.split()) <= 6:
-            continue
+    if name.endswith(".pptx"):
+        return extract_pptx_text(file_bytes), "PowerPoint presentation"
 
-        requirements.append(cleaned)
+    raise ValueError(f"Unsupported document format: {filename}")
 
-    if not requirements:
-        requirements = [
-            sentence.strip()
-            for sentence in re.split(r"(?<=[.!?])\s+", text)
-            if len(sentence.strip()) >= 12
+
+def extract_zip_documents(file_bytes: bytes) -> tuple[str, list[str]]:
+    """Read supported documents from a ZIP without executing its contents."""
+    parts = []
+    included_files = []
+    total_size = 0
+
+    with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
+        members = [
+            item
+            for item in archive.infolist()
+            if not item.is_dir()
+            and not item.filename.startswith("__MACOSX/")
         ]
 
-    return list(dict.fromkeys(requirements))[:50]
+        if len(members) > MAX_ZIP_FILES:
+            raise ValueError(
+                f"ZIP contains more than {MAX_ZIP_FILES} files."
+            )
 
+        for member in members:
+            name = member.filename
+            normalized_name = name.replace("\\", "/")
+            path_parts = normalized_name.split("/")
 
-def is_database_requirement(requirement: str) -> bool:
-    """Identify requirements explicitly about persistence or databases."""
-    text = requirement.lower()
-
-    phrases = (
-        "database",
-        "persistent storage",
-        "stores tasks",
-        "store tasks",
-        "save tasks",
-        "save data",
-        "persist data",
-        "persist tasks",
-        "store data",
-    )
-
-    return any(phrase in text for phrase in phrases)
-
-
-def match_requirements(
-    requirements: list[str],
-    source_files: list[dict[str, str]],
-) -> list[dict[str, object]]:
-    """Find potential implementation evidence using conservative heuristics."""
-    results = []
-
-    implementation_extensions = {
-        ".py",
-        ".js",
-        ".jsx",
-        ".ts",
-        ".tsx",
-        ".java",
-        ".c",
-        ".cpp",
-        ".h",
-        ".cs",
-        ".go",
-        ".rs",
-        ".php",
-        ".rb",
-        ".swift",
-        ".kt",
-        ".sql",
-    }
-
-    for requirement in requirements:
-        requirement_terms = tokenize(requirement)
-        evidence = []
-        needs_database = is_database_requirement(requirement)
-
-        for source in source_files:
-            path = source["path"]
-            source_text = source["text"]
-            source_lower = source_text.lower()
-
-            suffix = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
-
-            # Documentation is context, not proof of implementation.
-            if suffix in {".md", ".txt"}:
-                continue
-
-            if suffix not in implementation_extensions:
-                continue
-
-            # Database requirements need database-related code evidence.
-            if needs_database and not any(
-                indicator in source_lower for indicator in DATABASE_INDICATORS
+            if (
+                normalized_name.startswith("/")
+                or ".." in path_parts
+                or ":" in path_parts[0]
             ):
                 continue
 
-            source_terms = tokenize(source_text)
-            overlap = requirement_terms & source_terms
-
-            if not overlap:
+            if not name.lower().endswith(SUPPORTED_DOCUMENTS):
                 continue
 
-            score = len(overlap) / max(len(requirement_terms), 1)
+            if member.file_size > MAX_ZIP_MEMBER_BYTES:
+                continue
 
-            evidence.append(
+            total_size += member.file_size
+
+            if total_size > MAX_ZIP_TOTAL_BYTES:
+                raise ValueError(
+                    "The ZIP's supported documents exceed the size limit."
+                )
+
+            content = archive.read(member)
+            extracted, _ = extract_text_by_name(name, content)
+
+            if extracted.strip():
+                parts.append(f"DOCUMENT: {name}\n{extracted}")
+                included_files.append(name)
+
+    return "\n\n".join(parts), included_files
+
+
+def extract_uploaded_file(uploaded_file) -> tuple[str, str]:
+    """Extract text from one uploaded document or ZIP archive."""
+    file_bytes = uploaded_file.getvalue()
+
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise ValueError("The uploaded file exceeds the 25 MB limit.")
+
+    if uploaded_file.name.lower().endswith(".zip"):
+        text, filenames = extract_zip_documents(file_bytes)
+        details = (
+            "ZIP archive; documents read: "
+            + (", ".join(filenames) if filenames else "none")
+        )
+        return text, details
+
+    return extract_text_by_name(uploaded_file.name, file_bytes)
+
+
+def review_project_document(text: str) -> dict:
+    """Create a preliminary heuristic-based document audit."""
+    cleaned = text.strip()
+
+    if not cleaned:
+        return {
+            "status": "Insufficient content",
+            "summary": "No readable text was extracted.",
+            "findings": [
                 {
-                    "path": path,
-                    "matched_terms": sorted(overlap),
-                    "score": round(score, 2),
+                    "area": "Document content",
+                    "status": "Needs attention",
+                    "details": (
+                        "No readable text was found. Check the file or "
+                        "try a clearer document."
+                    ),
+                }
+            ],
+            "candidate_requirements": [],
+            "limitations": [
+                "No source code was inspected.",
+                "This version uses keyword and pattern checks, not an AI model.",
+            ],
+            "extracted_text_preview": "",
+        }
+
+    lower_text = cleaned.lower()
+
+    categories = {
+        "Project objectives": [
+            "objective",
+            "goal",
+            "purpose",
+            "problem statement",
+            "aim",
+            "intended to",
+        ],
+        "Requirements": [
+            "requirement",
+            "must ",
+            "shall ",
+            "should ",
+            "needs to",
+            "has to",
+        ],
+        "Deliverables": [
+            "deliverable",
+            "submission",
+            "expected output",
+            "final product",
+            "hand over",
+        ],
+        "Timeline": [
+            "deadline",
+            "timeline",
+            "milestone",
+            "schedule",
+            "due date",
+            "week ",
+            "month ",
+        ],
+        "Risks and constraints": [
+            "risk",
+            "limitation",
+            "constraint",
+            "dependency",
+            "assumption",
+            "security concern",
+        ],
+        "Testing and acceptance": [
+            "test plan",
+            "testing",
+            "validation",
+            "acceptance criteria",
+            "success criteria",
+            "expected result",
+            "pass criteria",
+        ],
+    }
+
+    findings = []
+
+    for area, keywords in categories.items():
+        matches = [
+            term.strip()
+            for term in keywords
+            if term in lower_text
+        ]
+
+        if matches:
+            findings.append(
+                {
+                    "area": area,
+                    "status": "Related content found",
+                    "details": (
+                        "Matched wording: "
+                        + ", ".join(matches)
+                        + ". Check the surrounding text to confirm "
+                        "the information is sufficient."
+                    ),
+                }
+            )
+        else:
+            findings.append(
+                {
+                    "area": area,
+                    "status": "Review recommended",
+                    "details": (
+                        f"No obvious wording about {area.lower()} was found. "
+                        "It may be missing or described differently."
+                    ),
                 }
             )
 
-        evidence.sort(
-            key=lambda item: item["score"],
-            reverse=True,
-        )
+    # Extract sentences that might describe requirements.
+    candidates = []
+    seen = set()
 
-        best_score = evidence[0]["score"] if evidence else 0.0
+    for line in re.split(r"[\r\n]+", cleaned):
+        line = re.sub(
+            r"^\s*(?:[-*•]+|\d+[.)])\s*",
+            "",
+            line,
+        ).strip()
 
-        if best_score >= 0.5:
-            status = "Possible evidence"
-        elif best_score >= 0.2:
-            status = "Weak evidence"
-        else:
-            status = "No evidence found"
+        if not line:
+            continue
 
-        results.append(
+        sentences = re.split(r"(?<=[.!?])\s+", line)
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+
+            if len(sentence.split()) < 4 or len(sentence) > 400:
+                continue
+
+            sentence_lower = sentence.lower()
+
+            looks_like_requirement = bool(
+                re.search(
+                    r"\b(must|shall|should|needs to|has to|required to)\b",
+                    sentence_lower,
+                )
+                or re.search(
+                    r"\b(the system|the application|users?|admins?)\b",
+                    sentence_lower,
+                )
+                or re.search(
+                    r"^\s*(create|allow|provide|support|enable|store|"
+                    r"display|generate|prevent|ensure|manage|track|"
+                    r"send|upload|download)\b",
+                    sentence_lower,
+                )
+            )
+
+            if looks_like_requirement:
+                key = sentence_lower.rstrip(".!?")
+
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(sentence)
+
+    vague_terms = [
+        "user-friendly",
+        "fast",
+        "easy to use",
+        "secure",
+        "robust",
+        "efficient",
+        "scalable",
+        "good performance",
+        "intuitive",
+        "reliable",
+    ]
+
+    vague_matches = [
+        term for term in vague_terms if term in lower_text
+    ]
+
+    if vague_matches:
+        findings.append(
             {
-                "requirement": requirement,
-                "status": status,
-                "best_match_score": best_score,
-                "evidence": evidence[:3],
+                "area": "Potentially vague wording",
+                "status": "Review recommended",
+                "details": (
+                    "These terms may need measurable definitions: "
+                    + ", ".join(vague_matches)
+                    + ". Consider defining targets or test conditions."
+                ),
             }
         )
 
-    return results
+    if not candidates:
+        findings.append(
+            {
+                "area": "Requirement clarity",
+                "status": "Review recommended",
+                "details": (
+                    "No candidate requirements were extracted automatically. "
+                    "Check whether the document states specific behaviours."
+                ),
+            }
+        )
+
+    word_count = len(cleaned.split())
+    line_count = sum(
+        1 for line in cleaned.splitlines() if line.strip()
+    )
+
+    return {
+        "status": "Preliminary review complete",
+        "summary": (
+            f"Reviewed approximately {word_count} words across "
+            f"{line_count} non-empty lines. Extracted "
+            f"{len(candidates)} candidate requirement(s)."
+        ),
+        "findings": findings,
+        "candidate_requirements": candidates,
+        "limitations": [
+            "Analysis uses keywords and patterns, not semantic AI reasoning.",
+            "Missing keywords do not prove that information is absent.",
+            "Candidate requirements may include descriptive sentences.",
+            "The app does not inspect code or verify that features work.",
+            "Embedded images in DOCX and PPTX are not OCR-processed.",
+        ],
+        "extracted_text_preview": cleaned[:5000],
+    }
 
 
-def main() -> None:
+def main():
     st.set_page_config(
-        page_title="ProofSprint AI | Project Auditor",
-        page_icon="🔍",
+        page_title="ProofSprint AI | Document Auditor",
+        page_icon="🔎",
         layout="wide",
     )
 
     st.title("ProofSprint AI")
-    st.subheader("Project Auditor for Hackathon Teams and Developers")
+    st.subheader("Project Document Auditor")
+
     st.write(
-        "Compare a project brief with your source code, find potential "
-        "evidence gaps, and prepare for your submission."
+        "Upload one project document to review its objectives, requirements, "
+        "deliverables, timeline, risks, and testing information."
     )
 
     st.info(
-        "Prototype: this version uses keyword matching, not an AI model. "
-        "A match does not prove a feature works. Review findings manually."
+        "Document-only mode reviews written information. "
+        "It does not verify whether project features work."
     )
 
-    with st.sidebar:
-        st.header("Audit workflow")
-        st.write("1. Upload the project requirements.")
-        st.write("2. Upload the source-code ZIP.")
-        st.write("3. Review the evidence matches.")
-        st.write("4. Download the audit report.")
+    uploaded_file = st.file_uploader(
+        "Upload one file",
+        type=["pdf", "pptx", "docx", "txt", "md", "zip"],
+        accept_multiple_files=False,
+    )
 
-    left, right = st.columns(2)
-
-    with left:
-        st.markdown("### 1. Project requirements")
-        brief = st.file_uploader(
-            "Upload a problem statement or requirements document",
-            type=["pdf", "txt", "md"],
-            key="project_brief",
+    if uploaded_file is None:
+        st.caption(
+            "Supported formats: PDF, PPTX, DOCX, TXT, MD, and ZIP."
         )
+        return
 
-    with right:
-        st.markdown("### 2. Project source code")
-        project_zip = st.file_uploader(
-            "Upload the project as a ZIP file",
-            type=["zip"],
-            key="project_zip",
-        )
+    st.write(f"**Selected file:** {uploaded_file.name}")
 
-    brief_text = ""
-
-    if brief is not None:
+    if st.button("Run document audit", type="primary"):
         try:
-            brief_text = read_requirements(brief.name, brief.getvalue())
-            st.success("Requirements document loaded.")
+            with st.spinner("Extracting and reviewing document..."):
+                text, extraction_details = extract_uploaded_file(
+                    uploaded_file
+                )
 
-            with st.expander("Preview extracted requirements text"):
-                st.text(brief_text[:12000])
+                if not text.strip():
+                    st.session_state.pop("document_audit_report", None)
+                    st.warning(
+                        "No readable document text was found. For ZIP files, "
+                        "include supported PDF, DOCX, PPTX, TXT, or MD files."
+                    )
+                    return
+
+                report = review_project_document(text)
+                report["filename"] = uploaded_file.name
+                report["extraction_details"] = extraction_details
+
+                st.session_state["document_audit_report"] = report
 
         except (
-            pymupdf.FileDataError,
-            RuntimeError,
             ValueError,
+            zipfile.BadZipFile,
+            RuntimeError,
             OSError,
-        ):
+        ) as exc:
+            st.session_state.pop("document_audit_report", None)
+            st.error(f"Could not process the file: {exc}")
+            return
+
+        except Exception as exc:
+            st.session_state.pop("document_audit_report", None)
             st.error(
-                "Could not read the requirements document. "
-                "Check that the file is valid and try again."
+                f"An unexpected error occurred: {exc}. "
+                "Check the file and try again."
+            )
+            return
+
+    report = st.session_state.get("document_audit_report")
+
+    if report and report.get("filename") == uploaded_file.name:
+        st.divider()
+        st.header("Audit report")
+        st.write(f"**Status:** {report['status']}")
+        st.write(report["summary"])
+        st.write(f"**Extraction:** {report['extraction_details']}")
+
+        st.subheader("Findings")
+
+        for finding in report["findings"]:
+            st.markdown(
+                f"**{finding['area']}** — {finding['status']}"
+            )
+            st.write(finding["details"])
+
+        st.subheader("Candidate requirements")
+
+        requirements = report.get("candidate_requirements", [])
+
+        if requirements:
+            for number, requirement in enumerate(requirements, start=1):
+                st.write(f"{number}. {requirement}")
+        else:
+            st.info(
+                "No candidate requirements were extracted. "
+                "Review the document manually."
             )
 
-    project_files = []
-    warnings = []
+        st.subheader("Limitations")
 
-    if project_zip is not None:
-        project_files, warnings = inspect_project_zip(project_zip.getvalue())
+        for limitation in report["limitations"]:
+            st.write(f"- {limitation}")
 
-        if project_files:
-            st.success(f"Read {len(project_files)} source/documentation files.")
-
-        for warning in warnings:
-            st.warning(warning)
-
-    if st.button("Run project audit", type="primary"):
-        if not brief_text.strip():
-            st.error("Upload a readable project requirements document.")
-        elif not project_files:
-            st.error("Upload a ZIP containing supported source files.")
-        else:
-            requirements = extract_requirements(brief_text)
-
-            if not requirements:
-                st.error(
-                    "No requirements could be extracted. "
-                    "Try a text document with one requirement per line."
-                )
-            else:
-                results = match_requirements(requirements, project_files)
-
-                st.session_state["last_audit"] = {
-                    "project_brief": brief.name,
-                    "source_file_count": len(project_files),
-                    "requirements": results,
-                    "warnings": warnings,
-                }
-
-    report = st.session_state.get("last_audit")
-
-    if report:
-        st.divider()
-        st.header("Project audit report")
-
-        results = report["requirements"]
-
-        possible = sum(item["status"] == "Possible evidence" for item in results)
-        weak = sum(item["status"] == "Weak evidence" for item in results)
-        missing = sum(item["status"] == "No evidence found" for item in results)
-
-        first, second, third = st.columns(3)
-        first.metric("Possible evidence", possible)
-        second.metric("Weak evidence", weak)
-        third.metric("No evidence found", missing)
-
-        st.caption(
-            "These labels describe keyword matches only, not verified "
-            "feature completion or code correctness."
-        )
-
-        for index, item in enumerate(results, start=1):
-            with st.expander(f"{index}. {item['status']} — {item['requirement']}"):
-                evidence = item["evidence"]
-
-                if evidence:
-                    for match in evidence:
-                        st.write(f"**File:** `{match['path']}`")
-                        st.write("Matched terms: " + ", ".join(match["matched_terms"]))
-                        st.write(f"Keyword overlap: {match['score']:.0%}")
-                else:
-                    st.write(
-                        "No matching implementation evidence was found "
-                        "by the current heuristic."
-                    )
+        with st.expander("View extracted text preview"):
+            st.text(report.get("extracted_text_preview", ""))
 
         st.download_button(
-            "Download audit report (JSON)",
-            data=json.dumps(report, indent=2, ensure_ascii=False),
-            file_name="proofsprint_audit_report.json",
+            "Download report as JSON",
+            data=json.dumps(
+                report,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            file_name="proofsprint_document_audit.json",
             mime="application/json",
         )
 
